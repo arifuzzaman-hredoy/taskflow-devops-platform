@@ -14,7 +14,7 @@ sudo docker compose config --images
 
 echo
 echo "========== LATEST MAIN COMMIT =========="
-git ls-remote https://github.com/arifuzzaman-hredoy/DevOps-Real-World-Project-By-Python.git refs/heads/main
+git ls-remote https://github.com/arifuzzaman-hredoy/taskflow-devops-platform.git refs/heads/main
 
 echo
 echo "========== PUBLIC HEALTH CHECK =========="
