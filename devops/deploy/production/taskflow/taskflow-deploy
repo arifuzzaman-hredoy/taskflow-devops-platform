@@ -1,17 +1,26 @@
 #!/usr/bin/env bash
+# /usr/local/bin/taskflow-deploy
+# Deploys immutable GHCR images (backend + frontend) for the split TaskFlow stack.
+# Usage: sudo taskflow-deploy sha-<40-character commit SHA>
 set -Eeuo pipefail
 umask 077
 
 APP_DIR="${TASKFLOW_APP_DIR:-/opt/taskflow}"
 COMPOSE_FILE="$APP_DIR/compose.yaml"
-SERVICE="api"
+
+BACKEND_SERVICE="backend"
+FRONTEND_SERVICE="frontend"
 NGINX_SERVICE="nginx"
-CONTAINER="taskflow-api-1"
+BACKEND_CONTAINER="taskflow-backend-1"
+FRONTEND_CONTAINER="taskflow-frontend-1"
 NGINX_CONTAINER="taskflow-nginx-1"
-IMAGE_REPO="ghcr.io/arifuzzaman-hredoy/devops-real-world-project-by-python"
+
+BACKEND_REPO="ghcr.io/arifuzzaman-hredoy/taskflow-backend"
+FRONTEND_REPO="ghcr.io/arifuzzaman-hredoy/taskflow-frontend"
+
 HEALTH_URL="https://taskflow.oxytumzone.com/api/ready"
-HEALTH_ATTEMPTS=18
-ROLLBACK_ATTEMPTS=12
+HEALTH_ATTEMPTS=24
+ROLLBACK_ATTEMPTS=24
 RETRY_SECONDS=5
 TMP_DIR=""
 
@@ -25,6 +34,11 @@ cleanup() {
 }
 trap cleanup EXIT
 
+if [[ $EUID -ne 0 ]]; then
+    echo "ERROR: Run this script with sudo." >&2
+    exit 2
+fi
+
 if [[ $# -ne 1 ]]; then
     echo "Usage: sudo taskflow-deploy sha-<40-character commit SHA>" >&2
     exit 2
@@ -36,46 +50,56 @@ if [[ ! "$TAG" =~ ^sha-[0-9a-f]{40}$ ]]; then
     exit 2
 fi
 
-NEW_IMAGE="${IMAGE_REPO}:${TAG}"
+# Only one deployment at a time.
+exec 9>/var/lock/taskflow-deploy.lock
+if ! flock -n 9; then
+    echo "ERROR: Another deployment is already running." >&2
+    exit 1
+fi
+
+NEW_BACKEND_IMAGE="${BACKEND_REPO}:${TAG}"
+NEW_FRONTEND_IMAGE="${FRONTEND_REPO}:${TAG}"
 TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/taskflow-deploy.XXXXXXXX")"
 chmod 700 "$TMP_DIR"
 PUBLIC_RESPONSE="$TMP_DIR/public-readiness.json"
+
+compose() {
+    docker compose --project-directory "$APP_DIR" -f "$COMPOSE_FILE" "$@"
+}
 
 health_json_is_ready() {
     grep -Eq '"status"[[:space:]]*:[[:space:]]*"ready"' "$1" &&
         grep -Eq '"database"[[:space:]]*:[[:space:]]*"ok"' "$1"
 }
 
-container_running() {
-    local running
-    running="$(sudo docker inspect --format '{{.State.Running}}' "$CONTAINER" 2>/dev/null)" ||
-        return 1
-    [[ "$running" == "true" ]]
+# running AND docker healthcheck says healthy
+container_healthy() {
+    local state
+    state="$(docker inspect \
+        --format '{{.State.Running}} {{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' \
+        "$1" 2>/dev/null)" || return 1
+    [[ "$state" == "true healthy" ]]
+}
+
+container_image_id() {
+    docker inspect --format '{{.Image}}' "$1" 2>/dev/null
 }
 
 container_image_matches() {
-    local expected_image_id="$1"
-    local actual_image_id
-    actual_image_id="$(sudo docker inspect --format '{{.Image}}' "$CONTAINER" 2>/dev/null)" ||
-        return 1
-    [[ "$actual_image_id" == "$expected_image_id" ]]
+    local actual
+    actual="$(container_image_id "$1")" || return 1
+    [[ "$actual" == "$2" ]]
 }
 
 internal_readiness() {
-    if sudo docker exec "$CONTAINER" node -e '
-fetch("http://127.0.0.1:3000/api/ready", { signal: AbortSignal.timeout(3000) })
+    docker exec "$BACKEND_CONTAINER" node -e '
+fetch("http://127.0.0.1:3001/api/ready", { signal: AbortSignal.timeout(3000) })
   .then(async response => {
     const payload = await response.json();
     if (!response.ok || payload.status !== "ready" || payload.database !== "ok") process.exit(1);
   })
   .catch(() => process.exit(1));
-' >/dev/null 2>&1; then
-        return 0
-    fi
-
-    sudo docker inspect "$CONTAINER" \
-        --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' \
-        2>/dev/null | grep -qx healthy
+' >/dev/null 2>&1
 }
 
 public_readiness() {
@@ -88,80 +112,60 @@ public_readiness() {
     [[ "$http_status" == "200" ]] && health_json_is_ready "$PUBLIC_RESPONSE"
 }
 
-recreate_nginx() {
-    sudo docker compose -f "$COMPOSE_FILE" up -d --no-deps --force-recreate \
-        "$NGINX_SERVICE" >/dev/null 2>&1 &&
-        sudo docker exec "$NGINX_CONTAINER" nginx -t >/dev/null 2>&1
+# Print a repo@sha256:<digest> reference for an image ID, if one exists.
+digest_ref_of() {
+    local image_id="$1" repo="$2" ref hash
+    while IFS= read -r ref; do
+        if [[ "$ref" == "$repo@sha256:"* ]]; then
+            hash="${ref#"$repo"@sha256:}"
+            if [[ "$hash" =~ ^[0-9a-f]{64}$ ]]; then
+                printf '%s\n' "$ref"
+                return 0
+            fi
+        fi
+    done < <(docker image inspect "$image_id" \
+        --format '{{range .RepoDigests}}{{println .}}{{end}}' 2>/dev/null)
+    return 1
 }
 
-compose_api_with_image() {
-    local image="$1"
-    TASKFLOW_API_IMAGE="$image" sudo --preserve-env=TASKFLOW_API_IMAGE \
-        docker compose -f "$COMPOSE_FILE" up -d --no-deps "$SERVICE" >/dev/null 2>&1 &&
-        recreate_nginx
+# Update backend + frontend to the given images, then recreate nginx so it
+# re-resolves the new container addresses. The images are passed through the
+# environment, so .env is never modified.
+apply_images() {
+    export TASKFLOW_BACKEND_IMAGE="$1"
+    export TASKFLOW_FRONTEND_IMAGE="$2"
+    compose up -d --no-deps "$BACKEND_SERVICE" "$FRONTEND_SERVICE" >/dev/null 2>&1 &&
+        compose up -d --no-deps --force-recreate "$NGINX_SERVICE" >/dev/null 2>&1 &&
+        docker exec "$NGINX_CONTAINER" nginx -t >/dev/null 2>&1
 }
 
-verify_deployed_image() {
-    local expected_image_id="$1"
-    local running=0
-    local image_matches=0
-    local internal_ready=0
-    local public_ready=0
-
-    container_running && running=1
-    container_image_matches "$expected_image_id" && image_matches=1
-    internal_readiness && internal_ready=1
-    public_readiness && public_ready=1
-
-    [[ "$running" -eq 1 && "$image_matches" -eq 1 &&
-        "$internal_ready" -eq 1 && "$public_ready" -eq 1 ]]
+verify_images() {
+    local backend_id="$1" frontend_id="$2"
+    container_healthy "$BACKEND_CONTAINER" &&
+        container_image_matches "$BACKEND_CONTAINER" "$backend_id" &&
+        container_healthy "$FRONTEND_CONTAINER" &&
+        container_image_matches "$FRONTEND_CONTAINER" "$frontend_id" &&
+        internal_readiness &&
+        public_readiness
 }
 
 rollback() {
-    local rollback_command_succeeded=1
-    local rollback_verified=0
-    local rollback_config_dir="${TASKFLOW_ROLLBACK_CONFIG_DIR:-}"
+    local attempt rollback_verified=0 command_ok=1
 
-    echo "Deployment failed; attempting rollback to the captured previous image."
-    if [[ -n "$rollback_config_dir" ]]; then
-        if [[ ! -s "$rollback_config_dir/compose.yaml" ||
-            ! -s "$rollback_config_dir/nginx.conf" ]]; then
-            echo "CRITICAL: Rollback configuration backup is incomplete."
-            return 1
-        fi
-        cp -- "$rollback_config_dir/compose.yaml" "$COMPOSE_FILE"
-        cp -- "$rollback_config_dir/nginx.conf" "$APP_DIR/nginx.conf"
-        if ! sudo docker compose -f "$COMPOSE_FILE" config --quiet ||
-            ! sudo docker exec "$NGINX_CONTAINER" nginx -t >/dev/null 2>&1; then
-            echo "CRITICAL: Previous production configuration could not be restored."
-            return 1
-        fi
-    fi
-
-    if ! compose_api_with_image "$OLD_IMAGE_REF"; then
-        rollback_command_succeeded=0
+    echo "Deployment failed; attempting rollback to the previous images."
+    if ! apply_images "$OLD_BACKEND_REF" "$OLD_FRONTEND_REF"; then
+        command_ok=0
     fi
 
     for ((attempt = 1; attempt <= ROLLBACK_ATTEMPTS; attempt++)); do
-        local running=0
-        local image_matches=0
-        local internal_ready=0
-        local public_ready=0
-
-        container_running && running=1
-        container_image_matches "$OLD_IMAGE_ID" && image_matches=1
-        internal_readiness && internal_ready=1
-        public_readiness && public_ready=1
-
-        if [[ "$running" -eq 1 && "$image_matches" -eq 1 &&
-            "$internal_ready" -eq 1 && "$public_ready" -eq 1 ]]; then
+        if verify_images "$OLD_BACKEND_ID" "$OLD_FRONTEND_ID"; then
             rollback_verified=1
             break
         fi
         sleep "$RETRY_SECONDS"
     done
 
-    if [[ "$rollback_command_succeeded" -eq 1 && "$rollback_verified" -eq 1 ]]; then
+    if [[ "$command_ok" -eq 1 && "$rollback_verified" -eq 1 ]]; then
         echo "Deployment failed; rollback succeeded and was verified."
     else
         echo "CRITICAL: Deployment failed and rollback verification failed."
@@ -170,89 +174,94 @@ rollback() {
 }
 
 fail_and_rollback() {
-    local failure="$1"
-    echo "ERROR: $failure" >&2
+    echo "ERROR: $1" >&2
     rollback || true
     exit 1
 }
 
-if ! container_running; then
-    echo "ERROR: Current API container is not running; refusing deployment." >&2
-    exit 1
-fi
+# ---------- Preflight: capture the currently running state ----------
 
-if [[ -n "${TASKFLOW_ROLLBACK_CONFIG_DIR:-}" ]] &&
-    [[ ! -s "$TASKFLOW_ROLLBACK_CONFIG_DIR/compose.yaml" ||
-        ! -s "$TASKFLOW_ROLLBACK_CONFIG_DIR/nginx.conf" ]]; then
-    echo "ERROR: Rollback configuration backup is incomplete; refusing deployment." >&2
-    exit 1
-fi
-
-OLD_IMAGE_ID="$(sudo docker inspect --format '{{.Image}}' "$CONTAINER" 2>/dev/null)" || {
-    echo "ERROR: Could not capture the current API image identity." >&2
-    exit 1
-}
-if [[ ! "$OLD_IMAGE_ID" =~ ^sha256:[0-9a-f]{64}$ ]]; then
-    echo "ERROR: Current API image identity is invalid; refusing deployment." >&2
-    exit 1
-fi
-
-OLD_REPO_DIGESTS="$(
-    sudo docker image inspect "$OLD_IMAGE_ID" \
-        --format '{{range .RepoDigests}}{{println .}}{{end}}' 2>/dev/null
-)" || {
-    echo "ERROR: Could not inspect the current API image for a rollback reference." >&2
-    exit 1
-}
-OLD_IMAGE_REF=""
-while IFS= read -r repo_digest; do
-    if [[ "$repo_digest" == "$IMAGE_REPO@sha256:"* ]]; then
-        candidate_digest="${repo_digest#"$IMAGE_REPO"@sha256:}"
-        if [[ "$candidate_digest" =~ ^[0-9a-f]{64}$ ]]; then
-            OLD_IMAGE_REF="$repo_digest"
-            break
-        fi
+for container in "$BACKEND_CONTAINER" "$FRONTEND_CONTAINER"; do
+    if ! container_healthy "$container"; then
+        echo "ERROR: $container is not running and healthy; refusing deployment." >&2
+        exit 1
     fi
-done <<< "$OLD_REPO_DIGESTS"
+done
 
-if [[ -z "$OLD_IMAGE_REF" ]]; then
-    echo "ERROR: No valid previous image digest for this repository; refusing deployment." >&2
-    exit 1
-fi
-
-ROLLBACK_IMAGE_ID="$(
-    sudo docker image inspect "$OLD_IMAGE_REF" --format '{{.Id}}' 2>/dev/null
-)" || {
-    echo "ERROR: Could not verify the previous image digest reference." >&2
+OLD_BACKEND_ID="$(container_image_id "$BACKEND_CONTAINER")" || {
+    echo "ERROR: Could not capture the current backend image identity." >&2
     exit 1
 }
-if [[ "$ROLLBACK_IMAGE_ID" != "$OLD_IMAGE_ID" ]]; then
-    echo "ERROR: Previous image digest does not match the running image; refusing deployment." >&2
+OLD_FRONTEND_ID="$(container_image_id "$FRONTEND_CONTAINER")" || {
+    echo "ERROR: Could not capture the current frontend image identity." >&2
     exit 1
-fi
+}
+for image_id in "$OLD_BACKEND_ID" "$OLD_FRONTEND_ID"; do
+    if [[ ! "$image_id" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+        echo "ERROR: A current image identity is invalid; refusing deployment." >&2
+        exit 1
+    fi
+done
+
+OLD_BACKEND_REF="$(digest_ref_of "$OLD_BACKEND_ID" "$BACKEND_REPO")" || {
+    echo "ERROR: No valid previous backend image digest; refusing deployment." >&2
+    exit 1
+}
+OLD_FRONTEND_REF="$(digest_ref_of "$OLD_FRONTEND_ID" "$FRONTEND_REPO")" || {
+    echo "ERROR: No valid previous frontend image digest; refusing deployment." >&2
+    exit 1
+}
+
+# The digest references must resolve to exactly the images that are running.
+[[ "$(docker image inspect "$OLD_BACKEND_REF" --format '{{.Id}}' 2>/dev/null)" == "$OLD_BACKEND_ID" ]] || {
+    echo "ERROR: Previous backend digest does not match the running image; refusing deployment." >&2
+    exit 1
+}
+[[ "$(docker image inspect "$OLD_FRONTEND_REF" --format '{{.Id}}' 2>/dev/null)" == "$OLD_FRONTEND_ID" ]] || {
+    echo "ERROR: Previous frontend digest does not match the running image; refusing deployment." >&2
+    exit 1
+}
 
 echo "========== TASKFLOW DEPLOYMENT =========="
-echo "Requested immutable image: $NEW_IMAGE"
-echo "Previous image identity captured for rollback."
+echo "Requested backend image:  $NEW_BACKEND_IMAGE"
+echo "Requested frontend image: $NEW_FRONTEND_IMAGE"
+echo "Previous image identities captured for rollback."
 
-if ! sudo docker pull "$NEW_IMAGE" >/dev/null 2>&1; then
-    fail_and_rollback "Could not pull the requested image."
+# ---------- Pull (nothing running is touched if this fails) ----------
+
+if ! docker pull "$NEW_BACKEND_IMAGE" >/dev/null 2>&1; then
+    echo "ERROR: Could not pull $NEW_BACKEND_IMAGE. Nothing was changed." >&2
+    exit 1
+fi
+if ! docker pull "$NEW_FRONTEND_IMAGE" >/dev/null 2>&1; then
+    echo "ERROR: Could not pull $NEW_FRONTEND_IMAGE. Nothing was changed." >&2
+    exit 1
 fi
 
-NEW_IMAGE_ID="$(sudo docker image inspect "$NEW_IMAGE" --format '{{.Id}}' 2>/dev/null)" || {
-    fail_and_rollback "Could not verify the pulled image identity."
+NEW_BACKEND_ID="$(docker image inspect "$NEW_BACKEND_IMAGE" --format '{{.Id}}' 2>/dev/null)" || {
+    echo "ERROR: Could not verify the pulled backend image. Nothing was changed." >&2
+    exit 1
 }
-if [[ ! "$NEW_IMAGE_ID" =~ ^sha256:[0-9a-f]{64}$ ]]; then
-    fail_and_rollback "The pulled image identity is invalid."
-fi
+NEW_FRONTEND_ID="$(docker image inspect "$NEW_FRONTEND_IMAGE" --format '{{.Id}}' 2>/dev/null)" || {
+    echo "ERROR: Could not verify the pulled frontend image. Nothing was changed." >&2
+    exit 1
+}
+for image_id in "$NEW_BACKEND_ID" "$NEW_FRONTEND_ID"; do
+    if [[ ! "$image_id" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+        echo "ERROR: A pulled image identity is invalid. Nothing was changed." >&2
+        exit 1
+    fi
+done
 
-if ! compose_api_with_image "$NEW_IMAGE"; then
-    fail_and_rollback "Compose could not update the API service."
+# ---------- Deploy ----------
+
+if ! apply_images "$NEW_BACKEND_IMAGE" "$NEW_FRONTEND_IMAGE"; then
+    fail_and_rollback "Compose could not update the backend/frontend services."
 fi
 
 healthy=0
 for ((attempt = 1; attempt <= HEALTH_ATTEMPTS; attempt++)); do
-    if verify_deployed_image "$NEW_IMAGE_ID"; then
+    if verify_images "$NEW_BACKEND_ID" "$NEW_FRONTEND_ID"; then
         healthy=1
         break
     fi
@@ -260,8 +269,9 @@ for ((attempt = 1; attempt <= HEALTH_ATTEMPTS; attempt++)); do
 done
 
 if [[ "$healthy" -ne 1 ]]; then
-    fail_and_rollback "The new API image did not pass identity and readiness checks."
+    fail_and_rollback "The new images did not pass identity and readiness checks."
 fi
 
 echo "SUCCESS: TaskFlow deployment is healthy."
-echo "Deployed image: $NEW_IMAGE"
+echo "Deployed backend:  $NEW_BACKEND_IMAGE"
+echo "Deployed frontend: $NEW_FRONTEND_IMAGE"

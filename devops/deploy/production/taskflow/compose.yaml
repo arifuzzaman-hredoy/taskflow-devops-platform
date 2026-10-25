@@ -125,15 +125,16 @@ services:
     networks: [app-net]
 
   node-exporter:
+    <<: *logging
     image: prom/node-exporter:v1.9.1
     network_mode: host
     pid: host
     command:
       - --path.rootfs=/host
-      - --web.listen-address=:9101
-      - --collector.filesystem.mount-points-exclude=^/(dev|proc|sys|run|var/lib/docker/.+|var/lib/containers/.+)($|/)
+      - --collector.filesystem.mount-points-exclude=^/(dev|proc|sys|var/lib/docker/.+|var/lib/containerd/.+|run/.+)$$
     volumes:
       - /:/host:ro,rslave
+    mem_limit: 64m
     restart: unless-stopped
 
 volumes:

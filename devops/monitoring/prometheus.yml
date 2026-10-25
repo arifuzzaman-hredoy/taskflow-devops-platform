@@ -17,8 +17,8 @@ scrape_configs:
       - targets:
           - backend:3001
 
-  # node-exporter container host network e chole (port 9101)
+  # node-exporter container host network e chole (port 9100)
   - job_name: node-exporter
     static_configs:
       - targets:
-          - host.docker.internal:9101
+          - host.docker.internal:9100
